@@ -1,0 +1,75 @@
+services:
+  # MongoDB database
+  mongo:
+    image: mongo:7.0
+    container_name: clinicai-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
+      MONGO_INITDB_DATABASE: clinicai
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - clinicai-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ClinicAI application
+  app:
+    build: .
+    container_name: clinicai-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - MONGODB_URI=mongodb://root:rootpassword@mongo:27017/clinicai?authSource=admin
+      - MONGODB_DB=clinicai
+      - LOG_LEVEL=INFO
+    env_file:
+      - .env
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - clinicai-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - ./logs:/app/logs
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: clinicai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - clinicai-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  mongo_data:
+    driver: local
+
+networks:
+  clinicai-network:
+    driver: bridge
+
