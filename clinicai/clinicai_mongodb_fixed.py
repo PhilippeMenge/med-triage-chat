@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from mongodb_database import MongoTriageDatabase
 
 # Carregar variáveis do arquivo .env
 load_dotenv()
@@ -168,6 +169,62 @@ class MongoTriageDatabase:
         except Exception as e:
             logger.error(f"❌ Erro ao salvar mensagem: {e}")
             return False
+    
+    async def get_messages(self, phone_hash: str, limit: int = 20) -> List[Dict]:
+        """Busca mensagens de um usuário."""
+        if mongo_db is None:
+            logger.warning("⚠️ MongoDB não conectado")
+            return []
+        
+        try:
+            cursor = mongo_db.messages.find(
+                {"phone_hash": phone_hash}
+            ).sort("timestamp", -1).limit(limit)
+            
+            messages = await cursor.to_list(length=limit)
+            
+            # Converter ObjectId para string e timestamps
+            for msg in messages:
+                msg["_id"] = str(msg["_id"])
+                if isinstance(msg.get("timestamp"), datetime):
+                    msg["timestamp"] = msg["timestamp"].isoformat()
+            
+            return messages
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar mensagens: {e}")
+            return []
+    
+    async def get_messages_since(self, phone_hash: str, since_timestamp: datetime, limit: int = 50) -> List[Dict]:
+        """Busca mensagens do MongoDB a partir de um timestamp específico."""
+        if mongo_db is None:
+            logger.warning("⚠️ MongoDB não conectado")
+            return []
+        
+        try:
+            # Garantir que since_timestamp seja datetime
+            if isinstance(since_timestamp, str):
+                since_timestamp = datetime.fromisoformat(since_timestamp.replace('Z', '+00:00'))
+            
+            cursor = mongo_db.messages.find({
+                "phone_hash": phone_hash,
+                "timestamp": {"$gte": since_timestamp}
+            }).sort("timestamp", -1).limit(limit)
+            
+            messages = await cursor.to_list(length=limit)
+            
+            # Converter ObjectId para string e timestamps
+            for msg in messages:
+                msg["_id"] = str(msg["_id"])
+                if isinstance(msg.get("timestamp"), datetime):
+                    msg["timestamp"] = msg["timestamp"].isoformat()
+            
+            logger.info(f"📊 Encontradas {len(messages)} mensagens desde {since_timestamp} para {phone_hash[:8]}...")
+            return messages
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar mensagens desde timestamp: {e}")
+            return []
     
     async def create_or_update_triage(self, phone_hash: str, slots: TriageSlots = None, 
                                     status: str = "open", emergency_flag: bool = False,
@@ -342,8 +399,8 @@ class WhatsAppClient:
 # GEMINI INTEGRATION
 # ================================
 
-class GeminiProcessor:
-    """Processador Gemini para validação e reescrita."""
+class GeminiTriageAgent:
+    """Agente Gemini para triagem conversacional natural."""
     
     def __init__(self):
         self.client = None
@@ -351,88 +408,252 @@ class GeminiProcessor:
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=GEMINI_API_KEY)
-                self.client = genai.GenerativeModel("gemini-flash-latest")
+                self.client = genai.GenerativeModel("gemini-2.5-flash-lite")
                 logger.info("✅ Gemini configurado")
             except Exception as e:
                 logger.error(f"❌ Erro Gemini: {e}")
     
-    async def validate_response(self, user_text: str, question: str, target_slot: str) -> bool:
-        """Valida se resposta é adequada."""
+    def _get_system_prompt(self) -> str:
+        """Retorna o prompt do sistema para o agente de triagem."""
+        return """Você é a ClinicAI, um assistente virtual de triagem médica. Sua missão é conduzir uma conversa acolhedora e empática para coletar informações que ajudem a agilizar o atendimento médico do usuário.
+
+PERSONA E COMPORTAMENTO:
+- Seja acolhedor, empático, calmo e profissional
+- Use linguagem clara, simples e direta
+- Evite jargões médicos
+- Seja humanizado mas profissional
+- Guie o usuário de forma paciente
+- Faça-o se sentir seguro para compartilhar informações
+
+MISSÃO - COLETAR ESTAS 6 INFORMAÇÕES:
+1. Queixa Principal: O motivo central do contato
+2. Sintomas Detalhados: Descrição de tudo que está sentindo
+3. Duração e Frequência: Desde quando começou e frequência
+4. Intensidade: Escala de dor/desconforto (0 a 10)
+5. Histórico Relevante: Condições pré-existentes ou episódios anteriores
+6. Medidas Tomadas: O que já fez para aliviar os sintomas
+
+IMPORTANTE:
+- Você só coleta informações, não dá conselhos
+- Seja apenas um organizador de dados
+- Mantenha conversa focada na coleta
+- Não interprete nem analise nada
+
+CASOS URGENTES:
+Se mencionar "peito", "respiração difícil", "desmaio" ou "sangramento", diga:
+"Sua situação parece necessitar atenção imediata. Procure o pronto-socorro ou ligue 192."
+
+SEMPRE RESPONDA EM JSON:
+{
+  "message": "sua resposta empática aqui",
+  "collected_info": {
+    "chief_complaint": "valor ou null",
+    "symptoms": "valor ou null", 
+    "duration_frequency": "valor ou null",
+    "intensity": "valor ou null",
+    "history": "valor ou null",
+    "measures_taken": "valor ou null"
+  },
+  "is_emergency": false,
+  "is_complete": false,
+  "next_focus": "próximo dado ou null"
+}"""
+
+    async def process_conversation(self, user_message: str, current_slots: TriageSlots, conversation_history: List[str] = None) -> Dict[str, Any]:
+        """Processa conversa e coleta informações de triagem."""
         if not self.client:
-            return True
+            # Fallback sem Gemini
+            return self._fallback_response(user_message, current_slots, conversation_history)
         
         try:
-            prompt = f"""
-Pergunta: "{question}"
-Resposta: "{user_text}"
-
-A resposta responde adequadamente à pergunta?
-Responda apenas "SIM" ou "NAO".
-"""
+            # Construir contexto da conversa
+            history_text = ""
+            if conversation_history:
+                history_text = "\n".join(conversation_history[-6:])  # Últimas 6 mensagens
             
+            # Informações já coletadas
+            collected_info = {
+                "chief_complaint": current_slots.chief_complaint,
+                "symptoms": current_slots.symptoms,
+                "duration_frequency": current_slots.duration_frequency,
+                "intensity": current_slots.intensity,
+                "history": current_slots.health_history,
+                "measures_taken": current_slots.measures_taken
+            }
+            
+            # Verificar se é início da conversa
+            is_conversation_start = user_message == "[INÍCIO DA CONVERSA]"
+            
+            if is_conversation_start:
+                user_prompt = f"""
+CONTEXTO DA CONVERSA:
+{history_text}
+
+SITUAÇÃO: Este é o INÍCIO de uma nova triagem. O usuário acabou de receber a mensagem de boas-vindas.
+
+INSTRUÇÕES:
+1. Faça a primeira pergunta para iniciar a coleta de informações
+2. Comece perguntando sobre a queixa principal de forma acolhedora
+3. Seja empático e profissional
+4. Retorne no formato JSON especificado
+
+IMPORTANTE: Esta é a PRIMEIRA pergunta da triagem. Seja acolhedor e direto.
+"""
+            else:
+                user_prompt = f"""
+CONTEXTO DA CONVERSA:
+{history_text}
+
+INFORMAÇÕES JÁ COLETADAS:
+{json.dumps(collected_info, indent=2, ensure_ascii=False)}
+
+NOVA MENSAGEM DO USUÁRIO:
+"{user_message}"
+
+INSTRUÇÕES:
+1. Analise a mensagem do usuário no contexto da conversa
+2. Extraia/atualize informações relevantes para os 6 tópicos da triagem
+3. Detecte sinais de emergência
+4. Responda de forma empática e natural
+5. Se necessário, faça uma pergunta para coletar informação faltante
+6. Retorne no formato JSON especificado
+
+Se todas as 6 informações estiverem coletadas, marque "is_complete": true e faça um resumo acolhedor.
+"""
+
             import asyncio
+            
+            # Configurações de segurança mais permissivas (apenas categorias válidas)
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+            
+            # Configurações de geração otimizadas
+            generation_config = {
+                "temperature": 0.3,  # Mais determinístico
+                "max_output_tokens": 400,
+                "top_p": 0.8,
+                "top_k": 40,
+                "candidate_count": 1
+            }
+            
             response = await asyncio.to_thread(
                 self.client.generate_content,
-                prompt,
-                generation_config={"temperature": 0.1, "max_output_tokens": 10}
+                f"{self._get_system_prompt()}\n\n{user_prompt}",
+                generation_config=generation_config,
+                safety_settings=safety_settings
             )
             
-            validation = response.text.strip().upper()
-            is_valid = "SIM" in validation
-            logger.info(f"🤖 Gemini validação {target_slot}: {'✅' if is_valid else '❌'}")
-            return is_valid
+            # Verificar se a resposta foi bloqueada
+            if not response.candidates or not response.candidates[0].content.parts:
+                logger.warning("⚠️ Resposta Gemini bloqueada por filtro de segurança")
+                return self._fallback_response(user_message, current_slots, conversation_history)
+            
+            # Parse do JSON
+            response_text = response.text.strip()
+            
+            # Limpar possíveis caracteres extras do JSON
+            if response_text.startswith("```json"):
+                response_text = response_text.replace("```json", "").replace("```", "").strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.replace("```", "").strip()
+            
+            try:
+                result = json.loads(response_text)
+                logger.info(f"🤖 Gemini processou conversa: {'emergência' if result.get('is_emergency') else 'normal'}")
+                return result
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Erro JSON Gemini: {e}")
+                logger.error(f"📄 Resposta raw: {response_text}")
+                return self._fallback_response(user_message, current_slots, conversation_history)
             
         except Exception as e:
-            logger.error(f"❌ Erro validação: {e}")
-            return True
+            logger.error(f"❌ Erro processamento Gemini: {e}")
+            return self._fallback_response(user_message, current_slots, conversation_history)
     
-    async def rewrite_question(self, original_question: str, target_slot: str) -> str:
-        """Reescreve pergunta."""
-        if not self.client:
-            return f"Vou perguntar de outro jeito: {original_question}"
+    def _fallback_response(self, user_message: str, current_slots: TriageSlots, conversation_history: List[str] = None) -> Dict[str, Any]:
+        """Resposta fallback quando Gemini não está disponível."""
+        # Detectar emergência básica
+        emergency_detected = is_emergency(user_message)
         
-        try:
-            prompt = f"""
-Pergunta original: "{original_question}"
-
-Reescreva de forma diferente mantendo o mesmo objetivo.
-Máximo 20 palavras.
-"""
-            
-            import asyncio
-            response = await asyncio.to_thread(
-                self.client.generate_content,
-                prompt,
-                generation_config={"temperature": 0.7, "max_output_tokens": 50}
-            )
-            
-            rewritten = response.text.strip()
-            logger.info(f"🤖 Gemini reescreveu {target_slot}")
-            return rewritten
-            
-        except Exception as e:
-            logger.error(f"❌ Erro reescrita: {e}")
-            return f"Vou perguntar de outro jeito: {original_question}"
+        if emergency_detected:
+            return {
+                "message": "Entendi. Seus sintomas podem indicar uma situação de emergência. Por favor, procure o pronto-socorro mais próximo ou ligue para o 192 imediatamente.",
+                "collected_info": current_slots.model_dump(),
+                "is_emergency": True,
+                "is_complete": False,
+                "next_focus": None
+            }
+        
+        # Verificar se já foi feita a primeira pergunta no histórico
+        conversation_history = conversation_history or []
+        first_question_already_asked = any(
+            "motivo do seu contato" in msg.lower() or "qual a sua queixa" in msg.lower() 
+            for msg in conversation_history
+        )
+        
+        # Lógica simples para próxima pergunta
+        next_slot = current_slots.get_next_slot_to_collect()
+        
+        if next_slot == "chief_complaint":
+            if first_question_already_asked:
+                # Se primeira pergunta já foi feita, assumir que usuário está respondendo
+                message = "Entendi. Agora pode me descrever com mais detalhes tudo o que você está sentindo?"
+                # Atualizar slots com a resposta do usuário
+                updated_slots = current_slots.model_dump()
+                updated_slots["chief_complaint"] = user_message.strip()
+                # Avançar para próximo slot
+                next_slot = "symptoms"
+            else:
+                message = "Para começarmos, pode me contar qual é o motivo do seu contato hoje?"
+                updated_slots = current_slots.model_dump()
+        elif next_slot == "symptoms":
+            message = "Entendi. Agora pode me descrever com mais detalhes tudo o que você está sentindo?"
+            updated_slots = current_slots.model_dump()
+            updated_slots[next_slot] = user_message.strip()
+        elif next_slot == "duration_frequency":
+            message = "Obrigada por compartilhar. Desde quando você está sentindo isso e com que frequência acontece?"
+            updated_slots = current_slots.model_dump()
+            updated_slots[next_slot] = user_message.strip()
+        elif next_slot == "intensity":
+            message = "Compreendo. Em uma escala de 0 a 10, onde 0 é sem dor e 10 é uma dor insuportável, como você classificaria a intensidade?"
+            updated_slots = current_slots.model_dump()
+            updated_slots[next_slot] = user_message.strip()
+        elif next_slot == "measures_taken":
+            message = "Entendo. Você já tentou fazer alguma coisa para aliviar esses sintomas?"
+            updated_slots = current_slots.model_dump()
+            updated_slots[next_slot] = user_message.strip()
+        elif next_slot == "health_history":
+            message = "Por último, você tem algum histórico de saúde que considera relevante compartilhar?"
+            updated_slots = current_slots.model_dump()
+            updated_slots[next_slot] = user_message.strip()
+        else:
+            message = "Obrigada por todas as informações. Um profissional analisará seu caso e você receberá retorno em breve."
+            updated_slots = current_slots.model_dump()
+        
+        return {
+            "message": message,
+            "collected_info": updated_slots,
+            "is_emergency": False,
+            "is_complete": next_slot is None,
+            "next_focus": next_slot
+        }
 
 # ================================
-# QUESTION MANAGER
+# CONVERSATION HELPER
 # ================================
 
-class QuestionManager:
-    """Gerenciador de perguntas específicas."""
-    
-    QUESTIONS = {
-        "chief_complaint": "Qual a sua queixa?",
-        "symptoms": "Pode descrever tudo que você está sentindo de maneira detalhada, por favor?",
-        "duration_frequency": "Desde quando os sintomas começaram e com que frequência ocorrem?",
-        "intensity": "Qual a intensidade da dor em uma escala de 0 a 10? Sendo 0 sem dor e 10 uma dor insuportável.",
-        "measures_taken": "Você já fez algo para tentar aliviar os sintomas?",
-        "health_history": "Você tem algum histórico de saúde relevante?"
-    }
-    
-    @classmethod
-    def get_question(cls, slot: str) -> str:
-        return cls.QUESTIONS.get(slot, "Pode me fornecer mais informações?")
+def get_welcome_message() -> str:
+    """Mensagem de boas-vindas inicial."""
+    return """🏥 *Olá! Sou a ClinicAI*
+
+Sou seu assistente virtual e vou ajudar a organizar suas informações para agilizar seu atendimento.
+
+⚠️ *Importante:* Sou um assistente virtual e não substituo uma avaliação médica profissional."""
 
 # ================================
 # EMERGENCY DETECTION
@@ -476,12 +697,11 @@ Sua situação parece ser urgente. Por favor:
 # ================================
 
 class TriageProcessor:
-    """Processador principal de triagem."""
+    """Processador principal de triagem conversacional."""
     
     def __init__(self):
         self.db = MongoTriageDatabase()
-        self.gemini = GeminiProcessor()
-        self.question_manager = QuestionManager()
+        self.gemini = GeminiTriageAgent()
         self.conversation_histories = {}
         self.TIMEOUT_MINUTES = 30
     
@@ -491,19 +711,63 @@ class TriageProcessor:
         time_diff = now - last_activity
         return time_diff.total_seconds() > (self.TIMEOUT_MINUTES * 60)
     
+    async def _load_conversation_history(self, phone_hash: str):
+        """Carrega histórico apenas da triagem atual do MongoDB."""
+        try:
+            # Buscar triagem ativa para obter created_at
+            current_triage = await self.db.get_active_triage(phone_hash)
+            if not current_triage:
+                self.conversation_histories[phone_hash] = []
+                return
+            
+            triage_start = current_triage.get('created_at')
+            if not triage_start:
+                # Fallback para últimas mensagens se não tiver created_at
+                messages = await self.db.get_messages(phone_hash, limit=10)
+                logger.info(f"📚 Usando fallback: últimas 10 mensagens para {phone_hash[:8]}...")
+            else:
+                # Buscar mensagens apenas a partir do início da triagem atual
+                messages = await self.db.get_messages_since(phone_hash, triage_start, limit=30)
+                logger.info(f"📚 Carregando mensagens desde {triage_start} para {phone_hash[:8]}...")
+            
+            # Reconstruir histórico em ordem cronológica
+            history = []
+            for msg in reversed(messages):  # Reverter para ordem cronológica
+                direction = msg.get("direction", "in")
+                text = msg.get("text", "")
+                
+                if direction == "in":
+                    history.append(f"Usuário: {text}")
+                elif direction == "out":
+                    history.append(f"ClinicAI: {text}")
+            
+            # Atualizar histórico na memória
+            self.conversation_histories[phone_hash] = history
+            
+            logger.info(f"📚 Histórico da triagem atual carregado: {phone_hash[:8]}... ({len(history)} mensagens)")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar histórico da triagem: {e}")
+            # Manter histórico vazio em caso de erro
+            self.conversation_histories[phone_hash] = []
+    
     async def process_message(self, phone: str, message_text: str, message_id: str = None) -> Dict[str, Any]:
-        """Processa mensagem principal."""
+        """Processa mensagem com conversa natural Gemini."""
         try:
             # Normalizar telefone
             normalized_phone = extract_phone_from_whatsapp(phone)
             phone_hash = hash_phone_number(normalized_phone)
             
-            logger.info(f"📱 Processando: {phone_hash[:8]}... - '{message_text[:30]}...'")
+            logger.info(f"💬 Conversando: {phone_hash[:8]}... - '{message_text[:30]}...'")
+            
+            # Inicializar histórico se não existir
+            if phone_hash not in self.conversation_histories:
+                self.conversation_histories[phone_hash] = []
             
             # Buscar triagem ativa
             current_triage = await self.db.get_active_triage(phone_hash)
             
-            # Verificar timeout
+            # Verificar timeout e carregar histórico se há triagem ativa
             if current_triage:
                 last_activity_str = current_triage.get('last_activity')
                 if last_activity_str:
@@ -516,7 +780,12 @@ class TriageProcessor:
                                 status="timeout",
                                 completed_at=datetime.now().isoformat()
                             )
+                            # Limpar histórico
+                            self.conversation_histories[phone_hash] = []
                             current_triage = None
+                        else:
+                            # Carregar histórico completo do MongoDB se triagem ativa
+                            await self._load_conversation_history(phone_hash)
                     except:
                         pass
             
@@ -528,29 +797,56 @@ class TriageProcessor:
                     last_activity=datetime.now().isoformat()
                 )
                 
-                # Enviar introdução + primeira pergunta
-                intro_message = (
-                    "🏥 *Olá! Sou a ClinicAI*\n\n"
-                    "Sou seu assistente virtual e vou ajudar a organizar suas informações para agilizar seu atendimento.\n\n"
-                    "⚠️ *Importante:* Sou um assistente virtual e não substituo uma avaliação médica.\n\n"
-                    "Para começarmos, qual é a sua queixa?"
-                )
+                # Enviar mensagem de boas-vindas
+                welcome_message = get_welcome_message()
                 
-                message_id = await WhatsAppClient.send_text_message(normalized_phone, intro_message)
+                message_id = await WhatsAppClient.send_text_message(normalized_phone, welcome_message)
                 
                 if message_id:
                     await self.db.save_message(
                         phone_hash=phone_hash,
                         direction="out",
                         message_id=message_id,
-                        text=intro_message
+                        text=welcome_message
                     )
+                
+                # Limpar e inicializar histórico
+                self.conversation_histories[phone_hash] = []
+                self.conversation_histories[phone_hash].append(f"ClinicAI: {welcome_message}")
+                
+                # Agora fazer Gemini gerar a primeira pergunta
+                logger.info(f"🤖 Gerando primeira pergunta com Gemini...")
+                current_slots = TriageSlots()
+                
+                first_question_result = await self.gemini.process_conversation(
+                    user_message="[INÍCIO DA CONVERSA]",
+                    current_slots=current_slots,
+                    conversation_history=self.conversation_histories[phone_hash]
+                )
+                
+                # Enviar primeira pergunta do Gemini
+                first_question = first_question_result["message"]
+                question_message_id = await WhatsAppClient.send_text_message(normalized_phone, first_question)
+                
+                # SEMPRE salvar a primeira pergunta, mesmo se WhatsApp falhar
+                await self.db.save_message(
+                    phone_hash=phone_hash,
+                    direction="out",
+                    message_id=question_message_id or f"out_{datetime.now().timestamp()}",
+                    text=first_question
+                )
+                self.conversation_histories[phone_hash].append(f"ClinicAI: {first_question}")
+                
+                logger.info(f"✅ Primeira pergunta enviada e registrada: '{first_question[:50]}...'")
                 
                 return {
                     "success": True,
-                    "action": "first_question_sent", 
+                    "action": "welcome_and_first_question_sent", 
                     "phone_hash": phone_hash
                 }
+            
+            # Adicionar mensagem do usuário ao histórico
+            self.conversation_histories[phone_hash].append(f"Usuário: {message_text}")
             
             # Salvar mensagem recebida
             await self.db.save_message(
@@ -561,9 +857,20 @@ class TriageProcessor:
                 meta={"source": "whatsapp"}
             )
             
-            # Verificar emergência
-            if is_emergency(message_text):
-                logger.warning(f"🚨 Emergência: {phone_hash[:8]}...")
+            # Buscar slots atuais
+            current_slots = await self.db.get_triage_slots(phone_hash)
+            
+            # Processar conversa com Gemini
+            logger.info(f"🤖 Enviando para Gemini: '{message_text[:50]}...'")
+            conversation_result = await self.gemini.process_conversation(
+                user_message=message_text,
+                current_slots=current_slots,
+                conversation_history=self.conversation_histories[phone_hash]
+            )
+            
+            # Verificar se é emergência
+            if conversation_result.get("is_emergency", False):
+                logger.warning(f"🚨 Emergência detectada: {phone_hash[:8]}...")
                 
                 await self.db.create_or_update_triage(
                     phone_hash=phone_hash,
@@ -572,16 +879,17 @@ class TriageProcessor:
                     last_activity=datetime.now().isoformat()
                 )
                 
-                emergency_response = get_emergency_response()
-                message_id = await WhatsAppClient.send_text_message(normalized_phone, emergency_response)
+                emergency_message = conversation_result["message"]
+                message_id = await WhatsAppClient.send_text_message(normalized_phone, emergency_message)
                 
                 if message_id:
                     await self.db.save_message(
                         phone_hash=phone_hash,
                         direction="out",
                         message_id=message_id,
-                        text=emergency_response
+                        text=emergency_message
                     )
+                    self.conversation_histories[phone_hash].append(f"ClinicAI: {emergency_message}")
                 
                 return {
                     "success": True,
@@ -590,87 +898,62 @@ class TriageProcessor:
                     "response_sent": bool(message_id)
                 }
             
-            # Buscar slots atuais
-            current_slots = await self.db.get_triage_slots(phone_hash)
-            current_slot = current_slots.get_next_slot_to_collect()
+            # Atualizar slots com informações coletadas
+            collected_info = conversation_result.get("collected_info", {})
+            updated_slots = TriageSlots(**collected_info)
             
-            if current_slot:
-                # Obter pergunta
-                current_question = self.question_manager.get_question(current_slot)
-                
-                # Validar resposta
-                logger.info(f"🔍 Validando {current_slot}: '{message_text[:30]}...'")
-                is_valid_response = await self.gemini.validate_response(
-                    user_text=message_text,
-                    question=current_question,
-                    target_slot=current_slot
-                )
-                
-                if is_valid_response:
-                    # Resposta válida - salvar e avançar
-                    setattr(current_slots, current_slot, message_text.strip())
-                    logger.info(f"✅ Coletado {current_slot}")
-                    
-                    await self.db.create_or_update_triage(
-                        phone_hash=phone_hash,
-                        slots=current_slots,
-                        status="open",
-                        last_activity=datetime.now().isoformat()
-                    )
-                    
-                    # Verificar se completo
-                    next_slot = current_slots.get_next_slot_to_collect()
-                    if next_slot:
-                        response_text = self.question_manager.get_question(next_slot)
-                    else:
-                        # Triagem completa
-                        response_text = await self._get_completion_message(current_slots)
-                        await self.db.create_or_update_triage(
-                            phone_hash=phone_hash,
-                            slots=current_slots,
-                            status="completed",
-                            last_activity=datetime.now().isoformat(),
-                            completed_at=datetime.now().isoformat()
-                        )
-                        logger.info(f"🎉 Triagem completa: {phone_hash[:8]}...")
-                else:
-                    # Resposta inválida - reescrever
-                    logger.info(f"❌ Resposta inválida {current_slot}")
-                    response_text = await self.gemini.rewrite_question(
-                        original_question=current_question,
-                        target_slot=current_slot
-                    )
-            else:
-                # Triagem já completa
-                response_text = (
-                    "🏥 *Olá! Sou a ClinicAI*\n\n"
-                    "Vejo que você já concluiu uma triagem recente. Para um novo atendimento, "
-                    "qual é o motivo principal do seu contato hoje?"
-                )
+            # Salvar slots atualizados
+            current_time = datetime.now().isoformat()
+            status = "completed" if conversation_result.get("is_complete", False) else "open"
+            completed_at = current_time if status == "completed" else None
             
-            # Enviar resposta
-            message_id = await WhatsAppClient.send_text_message(normalized_phone, response_text)
+            await self.db.create_or_update_triage(
+                phone_hash=phone_hash,
+                slots=updated_slots,
+                status=status,
+                last_activity=current_time,
+                completed_at=completed_at
+            )
+            
+            # Enviar resposta do Gemini
+            response_message = conversation_result["message"]
+            message_id = await WhatsAppClient.send_text_message(normalized_phone, response_message)
             
             if message_id:
                 await self.db.save_message(
                     phone_hash=phone_hash,
                     direction="out",
                     message_id=message_id,
-                    text=response_text
+                    text=response_message
                 )
+                self.conversation_histories[phone_hash].append(f"ClinicAI: {response_message}")
+                
+                # Manter histórico limitado
+                if len(self.conversation_histories[phone_hash]) > 12:
+                    self.conversation_histories[phone_hash] = self.conversation_histories[phone_hash][-8:]
+            
+            # Log do progresso
+            slots_filled = sum(1 for v in updated_slots.model_dump().values() if v is not None)
+            logger.info(f"📊 Progresso triagem: {slots_filled}/6 slots coletados")
+            
+            if status == "completed":
+                logger.info(f"🎉 Triagem completa: {phone_hash[:8]}...")
             
             return {
                 "success": True,
-                "status": "open",
+                "status": status,
                 "emergency": False,
                 "response_sent": bool(message_id),
                 "phone_hash": phone_hash,
-                "current_slot": current_slot,
-                "slots_filled": sum(1 for v in current_slots.model_dump().values() if v is not None)
+                "slots_filled": slots_filled,
+                "next_focus": conversation_result.get("next_focus"),
+                "is_complete": conversation_result.get("is_complete", False)
             }
             
         except Exception as e:
-            logger.error(f"❌ Erro processamento: {e}")
+            logger.error(f"❌ Erro processamento conversa: {e}")
+            import traceback
+            logger.error(f"🔍 Traceback: {traceback.format_exc()}")
             return {"success": False, "error": str(e)}
     
     async def _get_completion_message(self, slots: TriageSlots) -> str:
