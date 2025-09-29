@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from mongodb_database import MongoTriageDatabase
+# MongoTriageDatabase está definida neste arquivo
 
 # Carregar variáveis do arquivo .env
 load_dotenv()
@@ -408,19 +408,18 @@ class GeminiTriageAgent:
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=GEMINI_API_KEY)
-                self.client = genai.GenerativeModel("gemini-2.5-flash-lite")
+                self.client = genai.GenerativeModel("gemini-2.5-pro")
                 logger.info("✅ Gemini configurado")
             except Exception as e:
                 logger.error(f"❌ Erro Gemini: {e}")
     
     def _get_system_prompt(self) -> str:
         """Retorna o prompt do sistema para o agente de triagem."""
-        return """Você é a ClinicAI, um assistente virtual de triagem médica. Sua missão é conduzir uma conversa acolhedora e empática para coletar informações que ajudem a agilizar o atendimento médico do usuário.
+        return """Você é um assistente virtual de triagem. Sua missão é conduzir uma conversa acolhedora e empática para coletar informações que ajudem a agilizar o atendimento médico do usuário.
 
 PERSONA E COMPORTAMENTO:
 - Seja acolhedor, empático, calmo e profissional
 - Use linguagem clara, simples e direta
-- Evite jargões médicos
 - Seja humanizado mas profissional
 - Guie o usuário de forma paciente
 - Faça-o se sentir seguro para compartilhar informações
@@ -649,11 +648,7 @@ Se todas as 6 informações estiverem coletadas, marque "is_complete": true e fa
 
 def get_welcome_message() -> str:
     """Mensagem de boas-vindas inicial."""
-    return """🏥 *Olá! Sou a ClinicAI*
-
-Sou seu assistente virtual e vou ajudar a organizar suas informações para agilizar seu atendimento.
-
-⚠️ *Importante:* Sou um assistente virtual e não substituo uma avaliação médica profissional."""
+    return """🏥 *Olá! Sou seu assistente virtual e vou ajudar a organizar suas informações para agilizar seu atendimento."""
 
 # ================================
 # EMERGENCY DETECTION
